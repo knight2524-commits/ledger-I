@@ -30,11 +30,6 @@ def load_data(file):
         except: return pd.read_csv(file, encoding='utf-8')
     else: return pd.read_excel(file)
 
-def extract_code(text):
-    if pd.isna(text): return None
-    match = re.search(r'(\d{3}-\d{4})', str(text))
-    return match.group(1) if match else None
-
 def to_excel(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -73,15 +68,16 @@ if buy_file and sell_file:
         df_buy['원본행'] = df_buy.index + 2
         df_sell['원본행'] = df_sell.index + 2
 
-        # 2. 전처리
-        df_buy_proc = df_buy.dropna(subset=['규격', '합계금액']).copy()
-        df_buy_proc['매칭코드'] = df_buy_proc['규격'].apply(extract_code)
-        df_buy_proc = df_buy_proc.dropna(subset=['매칭코드'])
+        # 2. 전처리 및 지정된 열 매칭 (매출 E열 <-> 매입 I열)
+        # 매입: '공급사상품코드' 열 사용 (I열)
+        df_buy_proc = df_buy.dropna(subset=['공급사상품코드', '합계금액']).copy()
+        df_buy_proc['매칭코드'] = df_buy_proc['공급사상품코드'].astype(str).str.strip()
         df_buy_proc['매입수량'] = pd.to_numeric(df_buy_proc['매입수량'], errors='coerce').fillna(0)
         df_buy_proc['합계금액'] = pd.to_numeric(df_buy_proc['합계금액'], errors='coerce').fillna(0)
 
+        # 매출: '상품코드' 열 사용 (E열)
         df_sell_proc = df_sell.dropna(subset=['상품코드', '합계']).copy()
-        df_sell_proc['상품코드'] = df_sell_proc['상품코드'].astype(str).str.strip()
+        df_sell_proc['매칭코드'] = df_sell_proc['상품코드'].astype(str).str.strip()
         df_sell_proc['수량'] = pd.to_numeric(df_sell_proc['수량'], errors='coerce').fillna(0)
         df_sell_proc['합계'] = pd.to_numeric(df_sell_proc['합계'], errors='coerce').fillna(0)
 
@@ -97,16 +93,16 @@ if buy_file and sell_file:
             '원본행': lambda x: sorted(list(set(x.dropna().astype(int))))
         }).reset_index()
         
-        sell_grouped = df_sell_proc.groupby('상품코드').agg({
+        sell_grouped = df_sell_proc.groupby('매칭코드').agg({
             '품명': 'first', '수량': 'sum', '합계': 'sum',
             '일자_숫자': lambda x: sorted(list(set(x))),
             '원본행': lambda x: sorted(list(set(x.dropna().astype(int))))
         }).reset_index()
 
         # 4. 병합
-        merged = pd.merge(buy_grouped, sell_grouped, left_on='매칭코드', right_on='상품코드', how='outer').fillna(0)
+        merged = pd.merge(buy_grouped, sell_grouped, on='매칭코드', how='outer').fillna(0)
         
-        # 5. 로직 정의
+        # 5. 로직 정의 (미이월, 이월, 검증)
         mask_buy_only = (merged['수량'] == 0) & (merged['매입수량'] > 0)
         if buy_dates:
             mask_buy_only &= merged['일자_숫자_x'].apply(lambda x: any(d in buy_dates for d in x) if isinstance(x, list) else False)
@@ -136,7 +132,7 @@ if buy_file and sell_file:
         if exclude_zero_diff_amt:
             df_all = df_all[df_all['금액오차'] != 0]
 
-        # 7. UI 출력 및 엑셀 내보내기 버튼
+        # 7. UI 출력 및 엑셀 내보내기
         view_option = st.selectbox("표시 모드 선택", ["전체", "오차항목", "비교분석", "매입처 미이월", "매출처 이월", "당월/이월 검증"])
         display_map = {
             "전체": df_all, "오차항목": df_all[(df_all['금액오차']!=0)|(df_all['수량오차']!=0)], 
@@ -145,7 +141,6 @@ if buy_file and sell_file:
         }
         target_df = display_map[view_option]
 
-        # 엑셀 내보내기 버튼 배치
         excel_data = to_excel(target_df)
         st.download_button(
             label=f"📥 {view_option} 데이터 엑셀로 내보내기",
@@ -174,5 +169,5 @@ if buy_file and sell_file:
         c2.markdown(f'<div class="report-card"><p class="card-label">최종 매출 합계</p><p style="color:red; font-size:12px;">제외: -{ex_sell_sum:,.0f}</p><p class="price-text">{f_sell_total:,.0f}원</p></div>', unsafe_allow_html=True)
         c3.markdown(f'<div class="report-card"><p class="card-label">결과 차액</p><p style="font-size:12px;">&nbsp;</p><p class="diff-text" style="color:{"#007BFF" if (f_buy_total-f_sell_total)>=0 else "#FF4B4B"};">{(f_buy_total-f_sell_total):,.0f}원</p></div>', unsafe_allow_html=True)
 
-    except Exception as e: st.error(f"오류: {e}")
+    except Exception as e: st.error(f"오류: {e} - 파일의 열 이름(상품코드, 공급사상품코드 등)을 확인해주세요.")
 else: st.info("파일을 업로드해주세요.")
