@@ -26,9 +26,9 @@ with col2:
 
 def load_data(file):
     if file.name.endswith('.csv'):
-        try: return pd.read_csv(file, encoding='cp949')
-        except: return pd.read_csv(file, encoding='utf-8')
-    else: return pd.read_excel(file)
+        try: return pd.read_csv(file, encoding='cp949', dtype=str) # 모든 데이터를 일단 문자로 읽음
+        except: return pd.read_csv(file, encoding='utf-8', dtype=str)
+    else: return pd.read_excel(file, dtype=str) # 엑셀도 문자로 읽어 소수점 방지
 
 def to_excel(df):
     output = BytesIO()
@@ -59,25 +59,30 @@ val_dates = st.sidebar.multiselect("검증할 매입 일자 선택 (25~31일)", 
 
 if buy_file and sell_file:
     try:
-        # 1. 데이터 로드
+        # 1. 데이터 로드 (dtype=str로 데이터 깨짐 방지)
         df_buy = load_data(buy_file)
         df_sell = load_data(sell_file)
         
-        df_buy['일자_숫자'] = pd.to_datetime(df_buy['매입일자'], errors='coerce').dt.day
-        df_sell['일자_숫자'] = pd.to_datetime(df_sell['매출일자'], errors='coerce').dt.day
+        # 날짜 및 숫자 변환
+        df_buy['일자_숫자'] = pd.to_numeric(pd.to_datetime(df_buy['매입일자'], errors='coerce').dt.day, errors='coerce')
+        df_sell['일자_숫자'] = pd.to_numeric(pd.to_datetime(df_sell['매출일자'], errors='coerce').dt.day, errors='coerce')
         df_buy['원본행'] = df_buy.index + 2
         df_sell['원본행'] = df_sell.index + 2
 
-        # 2. 전처리 및 지정된 열 매칭 (매출 E열 <-> 매입 I열)
-        # 매입: '공급사상품코드' 열 사용 (I열)
-        df_buy_proc = df_buy.dropna(subset=['공급사상품코드', '합계금액']).copy()
-        df_buy_proc['매칭코드'] = df_buy_proc['공급사상품코드'].astype(str).str.strip()
+        # 2. 전처리 (매출 E열 <-> 매입 I열 매칭 강화)
+        # 매입: '공급사상품코드' (I열)
+        df_buy_proc = df_buy.copy()
+        df_buy_proc['매칭코드'] = df_buy_proc['공급사상품코드'].astype(str).str.strip().str.upper()
+        df_buy_proc = df_buy_proc[df_buy_proc['매칭코드'] != 'NAN'] # 빈 값 제외
+        
         df_buy_proc['매입수량'] = pd.to_numeric(df_buy_proc['매입수량'], errors='coerce').fillna(0)
         df_buy_proc['합계금액'] = pd.to_numeric(df_buy_proc['합계금액'], errors='coerce').fillna(0)
 
-        # 매출: '상품코드' 열 사용 (E열)
-        df_sell_proc = df_sell.dropna(subset=['상품코드', '합계']).copy()
-        df_sell_proc['매칭코드'] = df_sell_proc['상품코드'].astype(str).str.strip()
+        # 매출: '상품코드' (E열)
+        df_sell_proc = df_sell.copy()
+        df_sell_proc['매칭코드'] = df_sell_proc['상품코드'].astype(str).str.strip().str.upper()
+        df_sell_proc = df_sell_proc[df_sell_proc['매칭코드'] != 'NAN'] # 빈 값 제외
+        
         df_sell_proc['수량'] = pd.to_numeric(df_sell_proc['수량'], errors='coerce').fillna(0)
         df_sell_proc['합계'] = pd.to_numeric(df_sell_proc['합계'], errors='coerce').fillna(0)
 
@@ -86,23 +91,24 @@ if buy_file and sell_file:
         if exclude_zero_price:
             df_sell_proc = df_sell_proc[df_sell_proc['합계'] != 0]
 
-        # 3. 그룹화
+        # 3. 그룹화 (중복 코드 합산)
         buy_grouped = df_buy_proc.groupby('매칭코드').agg({
             '상품명': 'first', '매입수량': 'sum', '합계금액': 'sum',
-            '일자_숫자': lambda x: sorted(list(set(x))),
+            '일자_숫자': lambda x: sorted(list(set(x.dropna()))),
             '원본행': lambda x: sorted(list(set(x.dropna().astype(int))))
         }).reset_index()
         
         sell_grouped = df_sell_proc.groupby('매칭코드').agg({
             '품명': 'first', '수량': 'sum', '합계': 'sum',
-            '일자_숫자': lambda x: sorted(list(set(x))),
+            '일자_숫자': lambda x: sorted(list(set(x.dropna()))),
             '원본행': lambda x: sorted(list(set(x.dropna().astype(int))))
         }).reset_index()
 
-        # 4. 병합
+        # 4. 병합 (Outer Join)
         merged = pd.merge(buy_grouped, sell_grouped, on='매칭코드', how='outer').fillna(0)
         
-        # 5. 로직 정의 (미이월, 이월, 검증)
+        # 5. 로직 정의
+        # [매입처 미이월]: 매출에 아예 없는 건
         mask_buy_only = (merged['수량'] == 0) & (merged['매입수량'] > 0)
         if buy_dates:
             mask_buy_only &= merged['일자_숫자_x'].apply(lambda x: any(d in buy_dates for d in x) if isinstance(x, list) else False)
@@ -110,6 +116,7 @@ if buy_file and sell_file:
         df_buy_unmoved.columns = ['코드', '품명', '매입행', '매입수량', '매입금액']
         df_buy_unmoved['금액오차'] = df_buy_unmoved['매입금액']
 
+        # [매출처 이월]: 매입에 아예 없는 건
         mask_sell_only = (merged['매입수량'] == 0) & (merged['수량'] > 0)
         if sell_dates:
             mask_sell_only &= merged['일자_숫자_y'].apply(lambda x: any(d in sell_dates for d in x) if isinstance(x, list) else False)
@@ -117,6 +124,7 @@ if buy_file and sell_file:
         df_sell_carryover.columns = ['코드', '품명', '매출행', '매출수량', '매출금액']
         df_sell_carryover['금액오차'] = -df_sell_carryover['매출금액']
 
+        # [당월/이월 검증]
         mask_val = (merged['매입수량'] > 0) & (merged['수량'] == 0)
         if val_dates:
             mask_val &= merged['일자_숫자_x'].apply(lambda x: any(d in val_dates for d in x) if isinstance(x, list) else False)
@@ -132,7 +140,7 @@ if buy_file and sell_file:
         if exclude_zero_diff_amt:
             df_all = df_all[df_all['금액오차'] != 0]
 
-        # 7. UI 출력 및 엑셀 내보내기
+        # 7. UI 출력
         view_option = st.selectbox("표시 모드 선택", ["전체", "오차항목", "비교분석", "매입처 미이월", "매출처 이월", "당월/이월 검증"])
         display_map = {
             "전체": df_all, "오차항목": df_all[(df_all['금액오차']!=0)|(df_all['수량오차']!=0)], 
@@ -156,7 +164,7 @@ if buy_file and sell_file:
         
         st.dataframe(target_df, use_container_width=True)
 
-        # 8. 리포트 카드
+        # 8. 최종 리포트 카드
         st.divider()
         ex_buy_sum = df_buy_unmoved['매입금액'].sum() if exclude_buy_amt else 0
         ex_sell_sum = df_sell_carryover['매출금액'].sum() if exclude_sell_amt else 0
@@ -169,5 +177,5 @@ if buy_file and sell_file:
         c2.markdown(f'<div class="report-card"><p class="card-label">최종 매출 합계</p><p style="color:red; font-size:12px;">제외: -{ex_sell_sum:,.0f}</p><p class="price-text">{f_sell_total:,.0f}원</p></div>', unsafe_allow_html=True)
         c3.markdown(f'<div class="report-card"><p class="card-label">결과 차액</p><p style="font-size:12px;">&nbsp;</p><p class="diff-text" style="color:{"#007BFF" if (f_buy_total-f_sell_total)>=0 else "#FF4B4B"};">{(f_buy_total-f_sell_total):,.0f}원</p></div>', unsafe_allow_html=True)
 
-    except Exception as e: st.error(f"오류: {e} - 파일의 열 이름(상품코드, 공급사상품코드 등)을 확인해주세요.")
+    except Exception as e: st.error(f"오류: {e} - 업로드한 파일의 '상품코드', '공급사상품코드' 열 이름을 확인해 주세요.")
 else: st.info("파일을 업로드해주세요.")
